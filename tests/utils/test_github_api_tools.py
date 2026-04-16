@@ -20,6 +20,7 @@ from typing import Dict, Optional
 from unittest.mock import Mock, call, patch
 
 import pytest
+import requests
 
 # Use importorskip to gracefully handle import issues
 github_api_tools = pytest.importorskip(
@@ -357,7 +358,7 @@ class TestOtherGitHubAPIFunctions:
     """Test suite for other GitHub API functions with existing retry logic."""
 
     @patch('gittensor.utils.github_api_tools.requests.get')
-    @patch('gittensor.utils.github_api_tools.time.sleep')
+    @patch('gittensor.utils.retry.time.sleep')
     @patch('gittensor.utils.github_api_tools.bt.logging')
     def test_get_github_id_retry_logic(self, mock_logging, mock_sleep, mock_get):
         """Test that get_github_id retries on failure."""
@@ -366,8 +367,8 @@ class TestOtherGitHubAPIFunctions:
         mock_response_success.json.return_value = {'id': 12345}
 
         mock_get.side_effect = [
-            Exception('Timeout'),
-            Exception('Timeout'),
+            requests.exceptions.ConnectionError('Timeout'),
+            requests.exceptions.ConnectionError('Timeout'),
             mock_response_success,
         ]
 

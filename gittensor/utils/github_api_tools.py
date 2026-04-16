@@ -28,6 +28,7 @@ from gittensor.constants import (
     PR_LOOKBACK_DAYS,
 )
 from gittensor.utils.models import PRInfo
+from gittensor.utils.retry import paginated_github_get, retry_request
 from gittensor.validator.utils.load_weights import RepositoryConfig
 
 # core github graphql query
@@ -169,32 +170,20 @@ def get_github_user(token: str) -> Optional[Dict[str, Any]]:
         return None
 
     headers = make_headers(token)
-
-    # Retry logic for timeout issues
-    for attempt in range(6):
-        try:
-            response = requests.get(f'{BASE_GITHUB_API_URL}/user', headers=headers, timeout=30)
-            if response.status_code == 200:
-                try:
-                    user_data: Dict[str, Any] = response.json()
-                except Exception as e:  # pragma: no cover
-                    bt.logging.warning(f'Failed to parse GitHub /user JSON response: {e}')
-                    return None
-
-                return user_data
-
-            bt.logging.warning(
-                f'GitHub /user request failed with status {response.status_code} (attempt {attempt + 1}/6)'
-            )
-            if attempt < 5:
-                time.sleep(2)
-
-        except Exception as e:
-            bt.logging.warning(f'Could not fetch GitHub user (attempt {attempt + 1}/6): {e}')
-            if attempt < 5:  # Don't sleep on last attempt
-                time.sleep(2)
-
-    return None
+    response = retry_request(
+        lambda: requests.get(f'{BASE_GITHUB_API_URL}/user', headers=headers, timeout=30),
+        max_attempts=6,
+        backoff_base=2.0,
+        backoff_cap=2.0,
+        label='GitHub /user',
+    )
+    if response is None:
+        return None
+    try:
+        return response.json()
+    except Exception as e:  # pragma: no cover
+        bt.logging.warning(f'Failed to parse GitHub /user JSON response: {e}')
+        return None
 
 
 def get_github_id(token: str) -> Optional[str]:
@@ -218,145 +207,46 @@ def get_github_id(token: str) -> Optional[str]:
 
 
 def get_merge_base_sha(repository: str, base_sha: str, head_sha: str, token: str) -> Optional[str]:
-    """
-    Get the merge-base commit SHA between two refs using GitHub's compare API.
+    """Get the merge-base commit SHA between two refs using GitHub's compare API.
 
     The merge-base is the common ancestor commit — the correct "before" state
     for computing a PR's own changes via tree-diff scoring.
-
-    Args:
-        repository: Repository in format 'owner/repo'
-        base_sha: Base branch ref OID
-        head_sha: Head branch ref OID
-        token: GitHub PAT
-
-    Returns:
-        Merge-base commit SHA, or None if the request fails
     """
     headers = make_headers(token)
-    max_attempts = 3
-
-    for attempt in range(max_attempts):
-        try:
-            response = requests.get(
-                f'{BASE_GITHUB_API_URL}/repos/{repository}/compare/{base_sha}...{head_sha}',
-                headers=headers,
-                timeout=15,
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                merge_base = (data.get('merge_base_commit') or {}).get('sha')
-                if merge_base:
-                    return merge_base
-                bt.logging.warning(f'Compare API returned 200 but no merge_base_commit for {repository}')
-                return None
-
-            if attempt < max_attempts - 1:
-                backoff_delay = min(5 * (2 ** (attempt)), 30)
-                bt.logging.warning(
-                    f'Compare API for {repository} failed with status {response.status_code} '
-                    f'(attempt {attempt + 1}/{max_attempts}), retrying in {backoff_delay}s...'
-                )
-                time.sleep(backoff_delay)
-
-        except requests.exceptions.RequestException as e:
-            if attempt < max_attempts - 1:
-                backoff_delay = min(5 * (2 ** (attempt)), 30)
-                bt.logging.warning(
-                    f'Compare API error for {repository} (attempt {attempt + 1}/{max_attempts}): {e}, '
-                    f'retrying in {backoff_delay}s...'
-                )
-                time.sleep(backoff_delay)
-
-    bt.logging.warning(f'Compare API for {repository} failed after {max_attempts} attempts. Will use base_ref_oid.')
-    return None
+    response = retry_request(
+        lambda: requests.get(
+            f'{BASE_GITHUB_API_URL}/repos/{repository}/compare/{base_sha}...{head_sha}',
+            headers=headers,
+            timeout=15,
+        ),
+        max_attempts=3,
+        label=f'Compare API for {repository}',
+    )
+    if response is None:
+        bt.logging.warning(f'Compare API for {repository} failed after retries. Will use base_ref_oid.')
+        return None
+    data = response.json()
+    merge_base = (data.get('merge_base_commit') or {}).get('sha')
+    if not merge_base:
+        bt.logging.warning(f'Compare API returned 200 but no merge_base_commit for {repository}')
+    return merge_base
 
 
 def get_pull_request_file_changes(repository: str, pr_number: int, token: str) -> Optional[List[FileChange]]:
-    """
-    Get the diff for a specific PR by repository name and PR number.
+    """Get the diff for a specific PR by repository name and PR number.
 
-    Uses retry logic with exponential backoff for transient failures.
-    Paginates with per_page=100 (GitHub max) to fetch ALL changed files,
-    not just the default 30. On 5xx errors the page size is halved
-    (floor 10) to work around large-payload failures.
-
-    Args:
-        repository (str): Repository in format 'owner/repo'
-        pr_number (int): PR number
-        token (str): Github pat
-    Returns:
-        List[FileChanges]: List object with file changes or None if error
+    Paginates with per_page=100 (GitHub max) to fetch ALL changed files.
+    On 5xx errors the page size is halved (floor 10) to work around
+    large-payload failures.
     """
-    max_attempts = 3
-    per_page = 100
     headers = make_headers(token)
-
-    all_file_diffs: list = []
-    page = 1
-    attempt = 0
-    last_error = None
-
-    while attempt < max_attempts:
-        try:
-            response = requests.get(
-                f'{BASE_GITHUB_API_URL}/repos/{repository}/pulls/{pr_number}/files',
-                headers=headers,
-                params={'per_page': per_page, 'page': page},
-                timeout=15,
-            )
-
-            if response.status_code == 200:
-                file_diffs = response.json()
-                all_file_diffs.extend(file_diffs)
-
-                if len(file_diffs) < per_page:
-                    return [
-                        FileChange.from_github_response(pr_number, repository, file_diff)
-                        for file_diff in all_file_diffs
-                    ]
-
-                page += 1
-                continue
-
-            # Request failed — prepare retry
-            last_error = f'status {response.status_code}'
-
-            # Reduce page size on server-side errors (payload may be too large)
-            if response.status_code in (502, 503, 504):
-                per_page = max(per_page // 2, 10)
-
-            all_file_diffs = []
-            page = 1
-            attempt += 1
-
-            if attempt < max_attempts:
-                backoff_delay = min(5 * (2 ** (attempt - 1)), 30)
-                bt.logging.warning(
-                    f'File changes request for PR #{pr_number} in {repository} failed with {last_error} '
-                    f'(attempt {attempt}/{max_attempts}), per_page={per_page}, retrying in {backoff_delay}s...'
-                )
-                time.sleep(backoff_delay)
-
-        except requests.exceptions.RequestException as e:
-            last_error = str(e)
-            all_file_diffs = []
-            page = 1
-            attempt += 1
-
-            if attempt < max_attempts:
-                backoff_delay = min(5 * (2 ** (attempt - 1)), 30)
-                bt.logging.warning(
-                    f'File changes request error for PR #{pr_number} in {repository} '
-                    f'(attempt {attempt}/{max_attempts}): {e}, retrying in {backoff_delay}s...'
-                )
-                time.sleep(backoff_delay)
-
-    bt.logging.error(
-        f'File changes request for PR #{pr_number} in {repository} failed after {max_attempts} attempts: {last_error}'
+    url = f'{BASE_GITHUB_API_URL}/repos/{repository}/pulls/{pr_number}/files'
+    items = paginated_github_get(
+        url, headers, label=f'File changes for PR #{pr_number} in {repository}',
     )
-    return []
+    if items is None:
+        return []
+    return [FileChange.from_github_response(pr_number, repository, fd) for fd in items]
 
 
 def get_pull_request_maintainer_changes_requested_count(repository: str, pr_number: int, token: str) -> int:
@@ -367,78 +257,23 @@ def get_pull_request_maintainer_changes_requested_count(repository: str, pr_numb
     Uses retry logic with exponential backoff for transient failures.
     On error, returns 0 (fail-safe: no penalty applied).
 
-    Args:
-        repository (str): Repository in format 'owner/repo'
-        pr_number (int): PR number
-        token (str): Github pat
-    Returns:
-        int: Number of CHANGES_REQUESTED reviews from maintainers
+    Paginates with per_page=100 (GitHub max) to fetch ALL reviews.
+    On error, returns 0 (fail-safe: no penalty applied).
     """
-    max_attempts = 3
-    per_page = 100
     headers = make_headers(token)
-
-    all_reviews: list = []
-    page = 1
-    attempt = 0
-    last_error = None
-
-    while attempt < max_attempts:
-        try:
-            response = requests.get(
-                f'{BASE_GITHUB_API_URL}/repos/{repository}/pulls/{pr_number}/reviews',
-                headers=headers,
-                params={'per_page': per_page, 'page': page},
-                timeout=15,
-            )
-            if response.status_code == 200:
-                reviews = response.json()
-                all_reviews.extend(reviews)
-
-                if len(reviews) < per_page:
-                    return sum(
-                        1
-                        for review in all_reviews
-                        if review.get('state') == 'CHANGES_REQUESTED'
-                        and review.get('author_association') in MAINTAINER_ASSOCIATIONS
-                    )
-
-                page += 1
-                continue
-
-            # Request failed — prepare retry
-            last_error = f'status {response.status_code}'
-            all_reviews = []
-            page = 1
-            attempt += 1
-
-            if attempt < max_attempts:
-                backoff_delay = min(5 * (2 ** (attempt - 1)), 30)
-                bt.logging.warning(
-                    f'Reviews request for PR #{pr_number} in {repository} failed with status {response.status_code} '
-                    f'(attempt {attempt}/{max_attempts}), retrying in {backoff_delay}s...'
-                )
-                time.sleep(backoff_delay)
-
-        except requests.exceptions.RequestException as e:
-            last_error = str(e)
-            all_reviews = []
-            page = 1
-            attempt += 1
-
-            if attempt < max_attempts:
-                backoff_delay = min(5 * (2 ** (attempt - 1)), 30)
-                bt.logging.warning(
-                    f'Reviews request error for PR #{pr_number} in {repository} '
-                    f'(attempt {attempt}/{max_attempts}): {e}, retrying in {backoff_delay}s...'
-                )
-                time.sleep(backoff_delay)
-
-    bt.logging.error(
-        f'Reviews request for PR #{pr_number} in {repository} failed after {max_attempts} attempts: {last_error}. '
-        f'Defaulting to 0 (no penalty).'
+    url = f'{BASE_GITHUB_API_URL}/repos/{repository}/pulls/{pr_number}/reviews'
+    reviews = paginated_github_get(
+        url, headers, reduce_on_5xx=False,
+        label=f'Reviews for PR #{pr_number} in {repository}',
     )
-    return 0
+    if reviews is None:
+        return 0
+    return sum(
+        1
+        for review in reviews
+        if review.get('state') == 'CHANGES_REQUESTED'
+        and review.get('author_association') in MAINTAINER_ASSOCIATIONS
+    )
 
 
 # GraphQL fragment used by both issue submissions and solver detection.
@@ -652,59 +487,19 @@ def execute_graphql_query(
     max_attempts: int = 8,
     timeout: int = 30,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Execute a GraphQL query with retry logic and backoff.
-
-    Args:
-        query: The GraphQL query string
-        variables: Query variables
-        token: GitHub PAT for authentication
-        max_attempts: Maximum retry attempts (default 6)
-        timeout: Request timeout in seconds (default 30)
-
-    Returns:
-        Parsed JSON response data, or None if all attempts failed
-    """
+    """Execute a GraphQL query with retry logic and backoff."""
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-
-    for attempt in range(max_attempts):
-        try:
-            response = requests.post(
-                f'{BASE_GITHUB_API_URL}/graphql',
-                headers=headers,
-                json={'query': query, 'variables': variables},
-                timeout=timeout,
-            )
-
-            if response.status_code == 200:
-                return response.json()
-
-            # Retry on failure
-            if attempt < (max_attempts - 1):
-                backoff_delay = min(5 * (2**attempt), 30)  # max of 30 second wait between retries
-                bt.logging.warning(
-                    f'GraphQL request failed with status {response.status_code} '
-                    f'(attempt {attempt + 1}/{max_attempts}), retrying in {backoff_delay}s...'
-                )
-                time.sleep(backoff_delay)
-            else:
-                bt.logging.error(
-                    f'GraphQL request failed with status {response.status_code} '
-                    f'after {max_attempts} attempts: {response.text}'
-                )
-
-        except requests.exceptions.RequestException as e:
-            if attempt < (max_attempts - 1):
-                backoff_delay = min(5 * (2**attempt), 30)
-                bt.logging.warning(
-                    f'GraphQL request exception (attempt {attempt + 1}/{max_attempts}), '
-                    f'retrying in {backoff_delay}s: {e}'
-                )
-                time.sleep(backoff_delay)
-            else:
-                bt.logging.error(f'GraphQL request failed after {max_attempts} attempts: {e}')
-
-    return None
+    response = retry_request(
+        lambda: requests.post(
+            f'{BASE_GITHUB_API_URL}/graphql',
+            headers=headers,
+            json={'query': query, 'variables': variables},
+            timeout=timeout,
+        ),
+        max_attempts=max_attempts,
+        label='GraphQL request',
+    )
+    return response.json() if response is not None else None
 
 
 @dataclass
