@@ -250,12 +250,7 @@ def get_pull_request_file_changes(repository: str, pr_number: int, token: str) -
 
 
 def get_pull_request_maintainer_changes_requested_count(repository: str, pr_number: int, token: str) -> int:
-    """
-    Count CHANGES_REQUESTED reviews from maintainers for a PR.
-
-    Paginates with per_page=100 (GitHub max) to fetch ALL reviews.
-    Uses retry logic with exponential backoff for transient failures.
-    On error, returns 0 (fail-safe: no penalty applied).
+    """Count CHANGES_REQUESTED reviews from maintainers for a PR.
 
     Paginates with per_page=100 (GitHub max) to fetch ALL reviews.
     On error, returns 0 (fail-safe: no penalty applied).
